@@ -6,7 +6,6 @@ import java.io.FileInputStream;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.util.ArrayList;
-import java.util.LinkedList;
 
 public class Breaker {
     private final char[] mPossibles;
@@ -14,15 +13,36 @@ public class Breaker {
     private static final Object PASS_LOCK = new Object();
     private volatile boolean mIsFound = false;
     private volatile long mCounter = 0;
-    private char[] mFoundPassword = null;
-    private final int mStartDepth;
+    private char[] mFoundPassword = new char[0];
 
     private final PasswordGenerator mGenerator;
     private final PasswordTester[] mTesters;
 
+    private volatile char[] globalPass = new char[0];
+
+    private final Shutdown mShutdown = new Shutdown();
+
+    /**
+     * Will run when interrupting the program (Ctrl+C).
+     * This allows us to print a newline before terminating.
+     */
+    private static class Shutdown extends Thread {
+        private boolean keepOn = true;
+        @Override
+        public void run() {
+            // Just print a newline to save the last line.
+            System.out.println();
+            keepOn = false;
+        }
+
+        public boolean keepOn() {
+            return keepOn;
+        }
+    }
+
     /**
      * Sets up and initiates all the threads needed to break the given keystore.
-     * 
+     *
      * @param fileName
      *            The path and filename of the {@link KeyStore} you wish to
      *            break.
@@ -36,9 +56,8 @@ public class Breaker {
      *            value for your setup.
      */
     public Breaker(String fileName, int startDepth, int threads) {
-        mGenerator = new PasswordGenerator(threads * 2000);
+        mGenerator = new PasswordGenerator(startDepth - 1);
         mGenerator.setPriority(Thread.NORM_PRIORITY+1);
-        mStartDepth = startDepth;
 
         // Create list of possible characters
         // If needed, add or remove characters here
@@ -58,10 +77,10 @@ public class Breaker {
         possibleList.add('@');
 
         mPossibles = new char[possibleList.size()];
-        System.out.println("Possibles: " + possibleList.size());
+        System.out.println("Characters to test: " + possibleList.size());
         for (int i = 0; i < possibleList.size(); i++) {
             mPossibles[i] = possibleList.get(i).charValue();
-            System.out.println(mPossibles[i]);
+            System.out.print(mPossibles[i]);
         }
 
         mGenerator.start();
@@ -80,26 +99,32 @@ public class Breaker {
      * May take a <b>VERY</b> long time.
      * @return A {@link String} with the password used to open the given {@link KeyStore}
      */
-    public String getPassphrase() {
-        long startTime = System.currentTimeMillis();
+    public String getPassphrase() throws InterruptedException {
+        Runtime.getRuntime().addShutdownHook(mShutdown);
         System.out.println();
+        long totalStartTime = System.currentTimeMillis();
 
-        while (!mIsFound) {
+        while (!mIsFound && mShutdown.keepOn()) {
+            long startTime = System.currentTimeMillis();
+            long startCount = mCounter;
             try {
                 Thread.sleep(500);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
-            long time = (System.currentTimeMillis() - startTime)/1000;
+            long diffTime = System.currentTimeMillis() - startTime;
+            long diffCount = mCounter - startCount;
+
             long rate = 0;
-            if (time > 0) {
-                rate = mCounter / time;
+            if (diffTime > 0) {
+                rate = diffCount * 1000 / diffTime;
             }
 
-            System.out.print("Itr " 
-                    + mCounter 
-                    + " (" + time + " s -- " + rate + " pw/s): " 
-                    + mGenerator.peekPassword() + "       \r");
+            long totalTime = (System.currentTimeMillis() - totalStartTime) / 1000;
+
+            System.out.print("Tested " + mCounter
+                    + " pws (" + totalTime + " s -- " + rate + " pw/s): "
+                    + new String(globalPass) + "       \r");
         }
 
         return new String(mFoundPassword);
@@ -148,7 +173,7 @@ public class Breaker {
                 //System.out.println("Next pw");
                 mStream.reset();
                 try {
-                    passwd = mGenerator.getNextPassword().passwd;
+                    passwd = mGenerator.getNextPassword();
                     ks.load(mStream, passwd);
                 } catch (Throwable t) {
                     continue;
@@ -159,112 +184,53 @@ public class Breaker {
         }
     }
 
-    /**
-     * Data structure for holding a generated password.
-     */
-    private class Password {
-        private char[] passwd;
-        public Password(char[] chars) {
-            passwd = chars.clone();
-        }
-    }
-
     private class PasswordGenerator extends Thread {
-        private LinkedList<Password> mPasswords = new LinkedList<Password>();
-        private static final long MAX_QUEUE_WAIT = 1;
-        private static final String WARNING = "Warning: Queue empty! (You might want to trim mMaxNoPasswords or MAX_QUEUE_WAIT)";
-        private final int mMaxNoPasswords;
-        
-        public PasswordGenerator(int maxNoPasswords) {
-            mMaxNoPasswords = maxNoPasswords;
-        }
-        
-        /**
-         * Tries to maintain a list of {@link #mMaxNoPasswords} passwords.
-         */
-        @Override
-        public void run() {
-            int depth = mStartDepth - 1;
-            int[] counts = null;
-            char[] passwd = null;
-            boolean lastIteration = true;
-            while(!mIsFound) {
-                if (lastIteration) {
-                    depth++;
-                    counts = new int[depth];
-                    counts[0] = -1; // Make sure first iteration starts at correct character
-                    passwd = new char[depth];
-                    System.out.println();
-                    System.out.println("Starting search for depth: " + depth);
-                }
-                lastIteration = getIterationChars(counts, passwd);
-                
-                synchronized (PASS_LOCK) {
-                    mPasswords.add(new Password(passwd));
-                    PASS_LOCK.notifyAll();
+        private int mDepth;
+        int[] counts = null;
+        boolean lastIteration = true;
 
-                    while (mPasswords.size() >= mMaxNoPasswords && !mIsFound) {
-                        try {
-                            PASS_LOCK.wait(MAX_QUEUE_WAIT);
-                        } catch (InterruptedException e) {
-                            e.printStackTrace();
-                        }
-                    }
-                }
-            }
+        public PasswordGenerator(int depth) {
+            this.mDepth = depth;
         }
 
         /**
-         * Used by the password testing threads to pop a password from the 
+         * Used by the password testing threads to pop a password from the
          * head of the list.
          */
-        public Password getNextPassword() {
+        public char[] getNextPassword() {
+            int[] localCounts = null;
             synchronized (PASS_LOCK) {
-                while (mPasswords.size() == 0 && !mIsFound) {
-                    System.out.println(WARNING);
-                    try {
-                        PASS_LOCK.wait();
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
+                if (lastIteration) {
+                    mDepth++;
+                    counts = new int[mDepth];
+                    counts[0] = -1; // Make sure first iteration starts at correct character
+                    System.out.println();
+                    System.out.println("Starting search for depth: " + mDepth);
                 }
-                Password p = mPasswords.removeFirst();
-                mCounter++;
-                return p;
+                lastIteration = getIterationChars(counts);
+                localCounts = counts.clone();
             }
-        }
+            char[] passwd = countsToChars(localCounts);
+            mCounter++;
 
-        /**
-         * Takes a peek at the current head of the list of generated passwords,
-         * used for printing the current state to screen.  
-         */
-        public String peekPassword() {
-            synchronized (PASS_LOCK) {
-                while (mPasswords.size() == 0 && !mIsFound) {
-                    System.out.println(WARNING);
-                    try {
-                        PASS_LOCK.wait();
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                }
-                return new String(mPasswords.getFirst().passwd);
+            if (mCounter % 100000 == 0) {
+                globalPass = passwd;
             }
+            return passwd;
         }
 
         /**
          * Takes the state of counts, reverses it and puts it into out.
-         * 
+         *
          * If it were not reversed, passwords would be generated head-first,
          * now they are generated tail-first. Decide which way YOU want to go =)
-         * 
+         *
          * @param counts The state as related to {@link Breaker#mPossibles}
          * @param out The translated character from counts will be placed here.
          */
-        private boolean getIterationChars(int[] counts, char[] out) {
+        private boolean getIterationChars(int[] counts) {
             int idx = 0;
             counts[idx]++;
-            boolean lastIteration = true;
             while (idx < counts.length && counts[idx] >= mPossibles.length) {
                 counts[idx] = 0;
                 idx++;
@@ -272,12 +238,15 @@ public class Breaker {
                     counts[idx]++;
                 }
             }
+            return counts[counts.length - 1] == mPossibles.length-1;
+        }
+
+        private char[] countsToChars(int[] counts) {
+            char[] out = new char[counts.length];
             for (int i = 0; i < counts.length; i++) {
                 out[counts.length-1-i] = mPossibles[counts[i]];
-                lastIteration = lastIteration && counts[i] == mPossibles.length-1;
             }
-
-            return lastIteration;
+            return out;
         }
     }
 }
