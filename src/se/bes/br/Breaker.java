@@ -123,7 +123,9 @@ public class Breaker {
             long totalTime = (System.currentTimeMillis() - totalStartTime) / 1000;
 
             System.out.print("Tested " + mCounter
-                    + " pws (" + totalTime + " s -- " + rate + " pw/s): "
+                    + " pws (" + totalTime + " s -- " + rate + " pw/s avg: "
+                    + (totalTime > 0 ? (mCounter / totalTime) : 0)
+                    + "): "
                     + new String(globalPass) + "       \r");
         }
 
@@ -135,6 +137,7 @@ public class Breaker {
          * The bytes of a {@link KeyStore} loaded into RAM.
          */
         private ByteArrayInputStream mStream;
+        private int dataLength;
 
         /**
          * Loads a {@link KeyStore} on file into a {@link ByteArrayInputStream}
@@ -147,6 +150,8 @@ public class Breaker {
                 FileInputStream fis = new FileInputStream(file);
 
                 byte[] fileBytes = new byte[(int)file.length()];
+                
+                dataLength = fileBytes.length;
 
                 fis.read(fileBytes);
 
@@ -162,19 +167,16 @@ public class Breaker {
          */
         @Override
         public void run() {
-            KeyStore ks = null;
-            try {
-                ks = KeyStore.getInstance(KeyStore.getDefaultType());
-            } catch (KeyStoreException e) {
-                e.printStackTrace();
-            }
+            PasswordChecker pc = new PasswordChecker();
+            pc.bytes = new byte[dataLength - PasswordChecker.HASH_LENGTH];
             char[] passwd = null;
             while(!mIsFound) {
                 //System.out.println("Next pw");
                 mStream.reset();
                 try {
                     passwd = mGenerator.getNextPassword();
-                    ks.load(mStream, passwd);
+                    if (!pc.passwordMatches(mStream, dataLength, passwd))
+                        continue;
                 } catch (Throwable t) {
                     continue;
                 }

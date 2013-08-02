@@ -22,6 +22,9 @@ Performance
 On Linux with a Core2Quad I got about 150000 keys / second, 
 but on a Windows 7 machine (Also Core2Quad) I only got about 100000 keys / second.
 
+EDIT: I believe I've managed to increase that by 2-3x.
+
+
 Proof of concept
 ----------------
 There is a .keystore file in the test/ directory that has been prepared with the
